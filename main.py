@@ -61,6 +61,10 @@ async def websocket_endpoint(websocket: WebSocket):
     connected_clients.append(websocket)
     logger.info("Frontend connected. clients=%s", len(connected_clients))
     try:
+        await sync_from_github()
+    except Exception:
+        logger.exception("Could not sync GitHub history")
+    try:
         snapshot = load_events()
         if not snapshot:
             snapshot = list(live_events)
@@ -261,12 +265,19 @@ async def classify_event(event: dict) -> dict:
         return empty
 
 
-async def backfill_from_github() -> None:
-    """Load existing PRs and conversation comments if nothing is on screen yet."""
-    if live_events or not GITHUB_REPO:
+def event_key(event: dict) -> tuple:
+    return (event.get("event_type"), event.get("number"), event.get("url"), event.get("action"))
+
+
+def known_keys() -> set:
+    return {event_key(event) for event in live_events}
+
+
+async def sync_from_github() -> None:
+    """Fetch open/closed PRs from GitHub and add any the UI does not already have."""
+    if not GITHUB_REPO:
         return
 
-    logger.info("No events yet. Loading history from GitHub repo %s", GITHUB_REPO)
     headers = {"Accept": "application/vnd.github+json", "User-Agent": "github-pr-monitor"}
     async with httpx.AsyncClient(timeout=30.0, headers=headers) as client:
         pulls_response = await client.get(
@@ -275,6 +286,7 @@ async def backfill_from_github() -> None:
         )
         pulls_response.raise_for_status()
         pulls = pulls_response.json()
+        seen = known_keys()
 
         for pull in pulls:
             event = {
@@ -290,9 +302,12 @@ async def backfill_from_github() -> None:
                 "file_path": None,
                 "actor": login(pull.get("user")),
             }
-            event.update(await classify_event(event))
-            live_events.insert(0, event)
-            pending_supabase.append(event)
+            if event_key(event) not in seen:
+                event.update(await classify_event(event))
+                live_events.insert(0, event)
+                pending_supabase.append(event)
+                seen.add(event_key(event))
+                logger.info("Synced missing PR #%s", event.get("number"))
 
             comments_response = await client.get(
                 f"https://api.github.com/repos/{GITHUB_REPO}/issues/{pull.get('number')}/comments"
@@ -312,11 +327,12 @@ async def backfill_from_github() -> None:
                     "file_path": None,
                     "actor": login(comment.get("user")),
                 }
-                comment_event.update(await classify_event(comment_event))
-                live_events.insert(0, comment_event)
-                pending_supabase.append(comment_event)
-
-    logger.info("Loaded %s events from GitHub history", len(live_events))
+                if event_key(comment_event) not in seen:
+                    comment_event.update(await classify_event(comment_event))
+                    live_events.insert(0, comment_event)
+                    pending_supabase.append(comment_event)
+                    seen.add(event_key(comment_event))
+                    logger.info("Synced missing comment on PR #%s", comment_event.get("number"))
 
 
 def load_sqlite_events() -> list[dict]:
@@ -345,7 +361,7 @@ async def load_history() -> None:
     except Exception:
         logger.warning("Supabase table is not ready yet. History will upload after pr_events exists.")
     try:
-        await backfill_from_github()
+        await sync_from_github()
     except Exception:
         logger.exception("Could not load GitHub history")
     asyncio.create_task(supabase_retry_loop())
